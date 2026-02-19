@@ -5,13 +5,14 @@ package snowflake
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"github.com/snowflakedb/gosnowflake"
 	"testing"
 
+	"github.com/snowflakedb/gosnowflake"
 	"github.com/stretchr/testify/require"
 )
 
@@ -124,6 +125,21 @@ func TestGetSnowflakeConfig(t *testing.T) {
 			require.NotNil(t, cfg.PrivateKey)
 		})
 	}
+}
+
+func TestConnectionProducerDefaultMaxConnectionLifetime(t *testing.T) {
+	t.Parallel()
+
+	producer := &snowflakeConnectionProducer{}
+	config := map[string]interface{}{
+		"connection_url": "account.snowflakecomputing.com/db",
+		"username":       "vault",
+		"private_key":    []byte(testPrivateKey),
+	}
+
+	_, err := producer.Init(context.Background(), config, false)
+	require.NoError(t, err)
+	require.Equal(t, defaultMaxConnectionLifetime, producer.maxConnectionLifetime)
 }
 
 // TestGetPrivateKey ensures reading private

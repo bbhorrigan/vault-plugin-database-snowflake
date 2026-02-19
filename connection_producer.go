@@ -31,6 +31,8 @@ var (
 	accountAndDBNameFromConnURLRegex = regexp.MustCompile(`^(.+)\.snowflakecomputing\.com/(.+)$`) // Expected format: <account_name>.snowflakecomputing.com/<db_name>
 )
 
+const defaultMaxConnectionLifetime = 3*time.Hour + 30*time.Minute
+
 type snowflakeConnectionProducer struct {
 	ConnectionURL            string      `json:"connection_url"`
 	MaxOpenConnections       int         `json:"max_open_connections"`
@@ -117,7 +119,7 @@ func (c *snowflakeConnectionProducer) Init(ctx context.Context, initConfig map[s
 		c.MaxIdleConnections = c.MaxOpenConnections
 	}
 	if c.MaxConnectionLifetimeRaw == nil {
-		c.MaxConnectionLifetimeRaw = "0s"
+		c.MaxConnectionLifetimeRaw = defaultMaxConnectionLifetime.String()
 	}
 
 	c.maxConnectionLifetime, err = parseutil.ParseDurationSecond(c.MaxConnectionLifetimeRaw)
