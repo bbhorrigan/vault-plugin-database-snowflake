@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,52 @@ func connUrl(t *testing.T) string {
 	return connURL
 }
 
+func skipIfNoPassword(t *testing.T) {
+	t.Helper()
+	if os.Getenv(envVarSnowflakePassword) == "" {
+		t.Skip("skipping because SNOWFLAKE_PASSWORD is not set")
+	}
+}
+
+func skipIfNoKeyPair(t *testing.T) {
+	t.Helper()
+	if os.Getenv(envVarSnowflakePrivateKey) == "" {
+		t.Skip("skipping because SNOWFLAKE_PRIVATE_KEY is not set")
+	}
+}
+
+// connUrlKeyPair returns the connection URL, admin username, and decoded private key bytes
+// for key-pair authenticated admin operations. It skips the test if required env vars are missing.
+func connUrlKeyPair(t *testing.T) (connURL, username string, privateKeyBytes []byte) {
+	t.Helper()
+	connURL, rawBase64PrivateKey, username, err := getKeyPairAuthParameters("")
+	if err != nil {
+		t.Skipf("skipping key-pair test: %s", err)
+	}
+
+	privateKeyBytes, err = base64.StdEncoding.DecodeString(rawBase64PrivateKey)
+	if err != nil {
+		t.Fatalf("failed to decode base64 private key: %s", err)
+	}
+
+	return connURL, username, privateKeyBytes
+}
+
+// attemptDropUserKeyPair drops a user using key-pair authentication for the admin connection.
+func attemptDropUserKeyPair(connURL, adminUser string, adminPrivateKey []byte, username string) {
+	db, err := openSnowflake(connURL, adminUser, adminPrivateKey)
+	if err != nil {
+		log.Printf("key-pair connection issue: %s", err)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(fmt.Sprintf("DROP USER %s", username))
+	if err != nil {
+		log.Printf("query issue: %s", err)
+	}
+}
+
 // TestSnowflakeSQL_Initialize ensures initializing the Snowflake
 // DB works as expected for both user-pass and keypair authentication
 // scenarios
@@ -56,6 +103,8 @@ func TestSnowflakeSQL_Initialize(t *testing.T) {
 	}
 
 	t.Run("userpass auth", func(t *testing.T) {
+		skipIfNoPassword(t)
+
 		db := new()
 		defer dbtesting.AssertClose(t, db)
 
@@ -195,7 +244,7 @@ func TestSnowflake_NewUser(t *testing.T) {
 		expectErr      bool
 	}
 
-	tests := map[string]testCase{
+	passwordTests := map[string]testCase{
 		"new user with empty creation statements": {
 			credentialType: dbplugin.CredentialTypePassword,
 			creationStmts:  []string{},
@@ -218,6 +267,9 @@ func TestSnowflake_NewUser(t *testing.T) {
 			},
 			password: "secure_password",
 		},
+	}
+
+	keyPairTests := map[string]testCase{
 		"new user with 2048 bit rsa_private_key credential": {
 			credentialType: dbplugin.CredentialTypeRSAPrivateKey,
 			creationStmts: []string{
@@ -244,8 +296,9 @@ func TestSnowflake_NewUser(t *testing.T) {
 		},
 	}
 
-	for name, test := range tests {
+	for name, test := range passwordTests {
 		t.Run(name, func(t *testing.T) {
+			skipIfNoPassword(t)
 			connURL := connUrl(t)
 
 			db := new()
@@ -268,38 +321,69 @@ func TestSnowflake_NewUser(t *testing.T) {
 					Commands: test.creationStmts,
 				},
 				CredentialType: test.credentialType,
+				Password:       test.password,
 				Expiration:     time.Now().Add(time.Hour),
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), getRequestTimeout(t))
 			defer cancel()
 
-			switch test.credentialType {
-			case dbplugin.CredentialTypePassword:
-				createReq.Password = test.password
-				createResp, err := db.NewUser(ctx, createReq)
-				if test.expectErr {
-					require.Error(t, err)
-					return
-				} else if err != nil {
-					t.Fatalf("failed to create user %s", err)
-				}
-				defer attemptDropUser(connURL, createResp.Username)
-				assertPasswordCredentialsExist(t, connURL, createResp.Username, test.password)
-
-			case dbplugin.CredentialTypeRSAPrivateKey:
-				pub, priv := testGenerateRSAKeyPair(t, test.keyBits)
-				createReq.PublicKey = pub
-				createResp, err := db.NewUser(ctx, createReq)
-				if test.expectErr {
-					require.Error(t, err)
-					return
-				} else if err != nil {
-					t.Fatalf("failed to create user %s", err)
-				}
-				defer attemptDropUser(connURL, createResp.Username)
-				assertRSAKeyPairCredentialsExist(t, connURL, createResp.Username, priv)
+			createResp, err := db.NewUser(ctx, createReq)
+			if test.expectErr {
+				require.Error(t, err)
+				return
+			} else if err != nil {
+				t.Fatalf("failed to create user %s", err)
 			}
+			defer attemptDropUser(connURL, createResp.Username)
+			assertPasswordCredentialsExist(t, connURL, createResp.Username, test.password)
+		})
+	}
+
+	for name, test := range keyPairTests {
+		t.Run(name, func(t *testing.T) {
+			skipIfNoKeyPair(t)
+			connURL, adminUser, adminPrivateKey := connUrlKeyPair(t)
+
+			db := new()
+			defer dbtesting.AssertClose(t, db)
+
+			initReq := dbplugin.InitializeRequest{
+				Config: map[string]interface{}{
+					"connection_url": connURL,
+					"username":       adminUser,
+					"private_key":    adminPrivateKey,
+				},
+				VerifyConnection: true,
+			}
+			dbtesting.AssertInitialize(t, db, initReq)
+
+			pub, priv := testGenerateRSAKeyPair(t, test.keyBits)
+			createReq := dbplugin.NewUserRequest{
+				UsernameConfig: dbplugin.UsernameMetadata{
+					DisplayName: "test",
+					RoleName:    "test",
+				},
+				Statements: dbplugin.Statements{
+					Commands: test.creationStmts,
+				},
+				CredentialType: test.credentialType,
+				PublicKey:      pub,
+				Expiration:     time.Now().Add(time.Hour),
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), getRequestTimeout(t))
+			defer cancel()
+
+			createResp, err := db.NewUser(ctx, createReq)
+			if test.expectErr {
+				require.Error(t, err)
+				return
+			} else if err != nil {
+				t.Fatalf("failed to create user %s", err)
+			}
+			defer attemptDropUserKeyPair(connURL, adminUser, adminPrivateKey, createResp.Username)
+			assertRSAKeyPairCredentialsExist(t, connURL, createResp.Username, priv)
 		})
 	}
 }
@@ -308,6 +392,7 @@ func TestSnowflake_RenewUser(t *testing.T) {
 	if !runAcceptanceTests {
 		t.SkipNow()
 	}
+	skipIfNoPassword(t)
 
 	connURL := connUrl(t)
 
@@ -364,6 +449,7 @@ func TestSnowflake_RevokeUser(t *testing.T) {
 	if !runAcceptanceTests {
 		t.SkipNow()
 	}
+	skipIfNoPassword(t)
 
 	connURL := connUrl(t)
 
@@ -434,10 +520,127 @@ func TestSnowflake_RevokeUser(t *testing.T) {
 	}
 }
 
+func TestSnowflake_RenewUser_KeyPair(t *testing.T) {
+	if !runAcceptanceTests {
+		t.SkipNow()
+	}
+	skipIfNoKeyPair(t)
+
+	connURL, adminUser, adminPrivateKey := connUrlKeyPair(t)
+
+	db := new()
+	defer dbtesting.AssertClose(t, db)
+
+	initReq := dbplugin.InitializeRequest{
+		Config: map[string]interface{}{
+			"connection_url": connURL,
+			"username":       adminUser,
+			"private_key":    adminPrivateKey,
+		},
+		VerifyConnection: true,
+	}
+	dbtesting.AssertInitialize(t, db, initReq)
+
+	pub, priv := testGenerateRSAKeyPair(t, 2048)
+
+	createReq := dbplugin.NewUserRequest{
+		UsernameConfig: dbplugin.UsernameMetadata{
+			DisplayName: "test",
+			RoleName:    "test",
+		},
+		Statements: dbplugin.Statements{
+			Commands: []string{
+				`
+				CREATE USER {{username}} RSA_PUBLIC_KEY='{{public_key}}';
+				GRANT ROLE public TO USER {{username}};`,
+			},
+		},
+		CredentialType: dbplugin.CredentialTypeRSAPrivateKey,
+		PublicKey:      pub,
+		Expiration:     time.Now().Add(time.Hour),
+	}
+
+	createResp := dbtesting.AssertNewUser(t, db, createReq)
+	defer attemptDropUserKeyPair(connURL, adminUser, adminPrivateKey, createResp.Username)
+
+	assertRSAKeyPairCredentialsExist(t, connURL, createResp.Username, priv)
+
+	renewReq := dbplugin.UpdateUserRequest{
+		Username: createResp.Username,
+		Expiration: &dbplugin.ChangeExpiration{
+			NewExpiration: time.Now().Add(time.Minute),
+		},
+	}
+
+	dbtesting.AssertUpdateUser(t, db, renewReq)
+
+	// Sleep longer than the initial expiration time
+	time.Sleep(2 * time.Second)
+
+	assertRSAKeyPairCredentialsExist(t, connURL, createResp.Username, priv)
+}
+
+func TestSnowflake_RevokeUser_KeyPair(t *testing.T) {
+	if !runAcceptanceTests {
+		t.SkipNow()
+	}
+	skipIfNoKeyPair(t)
+
+	connURL, adminUser, adminPrivateKey := connUrlKeyPair(t)
+
+	db := new()
+	defer dbtesting.AssertClose(t, db)
+
+	initReq := dbplugin.InitializeRequest{
+		Config: map[string]interface{}{
+			"connection_url": connURL,
+			"username":       adminUser,
+			"private_key":    adminPrivateKey,
+		},
+		VerifyConnection: true,
+	}
+	dbtesting.AssertInitialize(t, db, initReq)
+
+	pub, priv := testGenerateRSAKeyPair(t, 2048)
+
+	createReq := dbplugin.NewUserRequest{
+		UsernameConfig: dbplugin.UsernameMetadata{
+			DisplayName: "test",
+			RoleName:    "test",
+		},
+		Statements: dbplugin.Statements{
+			Commands: []string{
+				`
+				CREATE USER {{username}} RSA_PUBLIC_KEY='{{public_key}}';
+				GRANT ROLE public TO USER {{username}};`,
+			},
+		},
+		CredentialType: dbplugin.CredentialTypeRSAPrivateKey,
+		PublicKey:      pub,
+		Expiration:     time.Now().Add(time.Hour),
+	}
+
+	createResp := dbtesting.AssertNewUser(t, db, createReq)
+
+	assertRSAKeyPairCredentialsExist(t, connURL, createResp.Username, priv)
+
+	deleteReq := dbplugin.DeleteUserRequest{
+		Username: createResp.Username,
+		Statements: dbplugin.Statements{
+			Commands: []string{
+				"DROP USER {{username}};",
+			},
+		},
+	}
+	dbtesting.AssertDeleteUser(t, db, deleteReq)
+	assertRSAKeyPairCredentialsDoNotExist(t, connURL, createResp.Username, priv)
+}
+
 func TestSnowflake_DefaultUsernameTemplate(t *testing.T) {
 	if !runAcceptanceTests {
 		t.SkipNow()
 	}
+	skipIfNoPassword(t)
 
 	connURL := connUrl(t)
 
@@ -484,6 +687,7 @@ func TestSnowflake_CustomUsernameTemplate(t *testing.T) {
 	if !runAcceptanceTests {
 		t.SkipNow()
 	}
+	skipIfNoPassword(t)
 
 	connURL := connUrl(t)
 
@@ -572,7 +776,7 @@ func getKeyPairAuthParameters(optionalQueryParams string) (connURL string, pKey 
 		err = multierror.Append(err, fmt.Errorf("SNOWFLAKE_DATABASE not set"))
 	}
 
-	connURL = fmt.Sprintf("%s.snowflakecomputing.com/%s", user, database)
+	connURL = fmt.Sprintf("%s.snowflakecomputing.com/%s", account, database)
 
 	if optionalQueryParams != "" {
 		connURL = fmt.Sprintf("%s?%s", connURL, optionalQueryParams)
@@ -582,29 +786,38 @@ func getKeyPairAuthParameters(optionalQueryParams string) (connURL string, pKey 
 }
 
 func verifyConnWithKeyPairCredential(connString, username string, private *rsa.PrivateKey) error {
-	conf, err := gosnowflake.ParseDSN(connString)
-	if err != nil {
-		return err
+	var config gosnowflake.Config
+	if strings.Contains(connString, "@") {
+		// Password-style DSN: user:pass@account
+		conf, err := gosnowflake.ParseDSN(connString)
+		if err != nil {
+			return err
+		}
+		config = gosnowflake.Config{
+			Account:  conf.Account,
+			Region:   conf.Region,
+			Database: conf.Database,
+			Schema:   conf.Schema,
+		}
+	} else {
+		// Key-pair style URL: account.snowflakecomputing.com/db
+		// ParseDSN rejects empty passwords, so extract account manually.
+		// Don't set the database — the newly created user may not have access to it.
+		parts := accountAndDBNameFromConnURLRegex.FindStringSubmatch(connString)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid key-pair connection URL format: %s", connString)
+		}
+		config = gosnowflake.Config{
+			Account: parts[1],
+		}
 	}
 
-	config := &gosnowflake.Config{
-		Authenticator: gosnowflake.AuthTypeJwt,
-		Account:       conf.Account,
-		Region:        conf.Region,
-		Database:      conf.Database,
-		Schema:        conf.Schema,
-		User:          username,
-		PrivateKey:    private,
-	}
-	dsn, err := gosnowflake.DSN(config)
-	if err != nil {
-		return err
-	}
+	config.Authenticator = gosnowflake.AuthTypeJwt
+	config.User = username
+	config.PrivateKey = private
 
-	db, err := sql.Open("snowflake", dsn)
-	if err != nil {
-		return err
-	}
+	connector := gosnowflake.NewConnector(gosnowflake.SnowflakeDriver{}, config)
+	db := sql.OpenDB(connector)
 	defer db.Close()
 	return db.Ping()
 }
